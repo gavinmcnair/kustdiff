@@ -319,7 +319,7 @@ resources:
 func TestBuildAll_MissingRoot(t *testing.T) {
 	t.Parallel()
 	// If rootDir doesn't exist in the worktree, buildAll should succeed silently.
-	err := buildAll(t.TempDir(), "nonexistent-root", 2, t.TempDir())
+	err := buildAll(t.TempDir(), "nonexistent-root", 2, 4, t.TempDir())
 	if err != nil {
 		t.Errorf("expected nil for missing root, got: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestBuildAll_MultipleTargets(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, "kustomization.yaml"), []byte(kustomizeApp("1.0")), 0o644)
 	}
 
-	if err := buildAll(worktree, "kustomize", 2, outDir); err != nil {
+	if err := buildAll(worktree, "kustomize", 2, 4, outDir); err != nil {
 		t.Fatalf("buildAll: %v", err)
 	}
 
@@ -545,5 +545,230 @@ func TestRun_CommitSHAAsRef(t *testing.T) {
 
 	if !strings.Contains(out, "VERSION") {
 		t.Errorf("expected VERSION in diff output, got:\n%s", out)
+	}
+}
+
+// ============================================================
+// E2E tests for narrowing and caching
+// ============================================================
+
+func TestRun_NarrowingSkipsUnchanged(t *testing.T) {
+	r := newTestRepo(t)
+	// Two targets: app and worker.
+	r.writeFile("kustomize/app/kustomization.yaml", kustomizeApp("1.0"))
+	r.writeFile("kustomize/worker/kustomization.yaml", kustomizeApp("1.0"))
+	r.commit("initial with two targets")
+	r.branch("feature")
+	// Only change app.
+	r.writeFile("kustomize/app/kustomization.yaml", kustomizeApp("2.0"))
+	r.commit("bump app version")
+	r.checkout("main")
+	cdRepo(t, r.dir)
+
+	out := captureStdout(t, func() {
+		if err := run(config{
+			baseRef: "main", headRef: "feature",
+			rootDir: "kustomize", maxDepth: 2,
+			noCache: true,
+		}); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	})
+
+	// Should show diff for app (version change).
+	if !strings.Contains(out, "app") {
+		t.Errorf("expected 'app' in diff output, got:\n%s", out)
+	}
+	// Worker shouldn't appear in diff since it's unchanged.
+	if strings.Contains(out, "worker") {
+		t.Errorf("worker should not appear in diff (unchanged), got:\n%s", out)
+	}
+}
+
+func TestRun_SharedBaseTriggersOverlays(t *testing.T) {
+	r := newTestRepo(t)
+
+	// Shared base.
+	r.writeFile("kustomize/base/kustomization.yaml", `apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: shared-config
+    literals:
+      - SHARED=v1
+`)
+	// Two overlays referencing the base.
+	for _, env := range []string{"staging", "prod"} {
+		r.writeFile("kustomize/"+env+"/kustomization.yaml", `apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+`)
+	}
+	r.commit("initial with shared base and overlays")
+	r.branch("feature")
+	// Change the shared base.
+	r.writeFile("kustomize/base/kustomization.yaml", `apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+configMapGenerator:
+  - name: shared-config
+    literals:
+      - SHARED=v2
+`)
+	r.commit("bump shared base")
+	r.checkout("main")
+	cdRepo(t, r.dir)
+
+	out := captureStdout(t, func() {
+		if err := run(config{
+			baseRef: "main", headRef: "feature",
+			rootDir: "kustomize", maxDepth: 3,
+			noCache: true,
+		}); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	})
+
+	// Both overlays should appear in the diff because their base changed.
+	if !strings.Contains(out, "staging") {
+		t.Errorf("expected 'staging' in diff output, got:\n%s", out)
+	}
+	if !strings.Contains(out, "prod") {
+		t.Errorf("expected 'prod' in diff output, got:\n%s", out)
+	}
+}
+
+func TestRun_FullBuildFlag(t *testing.T) {
+	r := newTestRepo(t)
+	r.writeFile("kustomize/app/kustomization.yaml", kustomizeApp("1.0"))
+	r.commit("initial")
+	r.branch("feature")
+	r.writeFile("kustomize/app/kustomization.yaml", kustomizeApp("2.0"))
+	r.commit("bump version")
+	r.checkout("main")
+	cdRepo(t, r.dir)
+
+	out := captureStdout(t, func() {
+		if err := run(config{
+			baseRef: "main", headRef: "feature",
+			rootDir: "kustomize", maxDepth: 2,
+			fullBuild: true, noCache: true,
+		}); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "VERSION") {
+		t.Errorf("expected VERSION in diff output, got:\n%s", out)
+	}
+}
+
+func TestRun_CacheHit(t *testing.T) {
+	r := newTestRepo(t)
+	r.writeFile("kustomize/app/kustomization.yaml", kustomizeApp("1.0"))
+	r.commit("initial")
+	r.branch("feature")
+	r.writeFile("kustomize/app/kustomization.yaml", kustomizeApp("2.0"))
+	r.commit("bump version")
+	r.checkout("main")
+	cdRepo(t, r.dir)
+
+	cacheDir := filepath.Join(t.TempDir(), "test-cache")
+
+	// First run: populates cache.
+	out1 := captureStdout(t, func() {
+		if err := run(config{
+			baseRef: "main", headRef: "feature",
+			rootDir: "kustomize", maxDepth: 2,
+			cacheDir: cacheDir,
+		}); err != nil {
+			t.Fatalf("first run: %v", err)
+		}
+	})
+
+	// Verify cache was populated (at least one file in the cache dir).
+	matches, _ := filepath.Glob(filepath.Join(cacheDir, "v1", "*", "*.yaml"))
+	if len(matches) == 0 {
+		t.Fatal("expected cache to be populated after first run")
+	}
+
+	// Second run: should use cache and produce equivalent diff content.
+	out2 := captureStdout(t, func() {
+		if err := run(config{
+			baseRef: "main", headRef: "feature",
+			rootDir: "kustomize", maxDepth: 2,
+			cacheDir: cacheDir,
+		}); err != nil {
+			t.Fatalf("second run: %v", err)
+		}
+	})
+
+	// Both runs should contain the same version change markers.
+	for _, marker := range []string{"VERSION", "1.0", "2.0"} {
+		if !strings.Contains(out1, marker) {
+			t.Errorf("first run missing %q in output", marker)
+		}
+		if !strings.Contains(out2, marker) {
+			t.Errorf("second run missing %q in output (cache hit)", marker)
+		}
+	}
+}
+
+func TestRun_WorkersFlag(t *testing.T) {
+	r := newTestRepo(t)
+	r.writeFile("kustomize/app/kustomization.yaml", kustomizeApp("1.0"))
+	r.writeFile("kustomize/worker/kustomization.yaml", kustomizeApp("1.0"))
+	r.commit("initial")
+	r.branch("feature")
+	r.writeFile("kustomize/app/kustomization.yaml", kustomizeApp("2.0"))
+	r.writeFile("kustomize/worker/kustomization.yaml", kustomizeApp("2.0"))
+	r.commit("bump both")
+	r.checkout("main")
+	cdRepo(t, r.dir)
+
+	out := captureStdout(t, func() {
+		if err := run(config{
+			baseRef: "main", headRef: "feature",
+			rootDir: "kustomize", maxDepth: 2,
+			maxWorkers: 1, fullBuild: true, noCache: true,
+		}); err != nil {
+			t.Fatalf("run with workers=1: %v", err)
+		}
+	})
+
+	if !strings.Contains(out, "VERSION") {
+		t.Errorf("expected VERSION in diff output, got:\n%s", out)
+	}
+}
+
+func TestFindTargets_AllFileNames(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	mustWrite := func(rel, content string) {
+		full := filepath.Join(root, rel)
+		os.MkdirAll(filepath.Dir(full), 0o755)
+		os.WriteFile(full, []byte(content), 0o644)
+	}
+	mustWrite("a/kustomization.yaml", "")
+	mustWrite("b/kustomization.yml", "")
+	mustWrite("c/Kustomization", "")
+	mustWrite("d/not-a-kustomization.yaml", "")
+
+	targets, err := findTargets(root, 2)
+	if err != nil {
+		t.Fatalf("findTargets: %v", err)
+	}
+	if len(targets) != 3 {
+		t.Errorf("expected 3 targets (a, b, c), got %d: %v", len(targets), targets)
+	}
+
+	names := make(map[string]bool)
+	for _, tgt := range targets {
+		names[filepath.Base(tgt)] = true
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		if !names[want] {
+			t.Errorf("expected target %q, found: %v", want, names)
+		}
 	}
 }

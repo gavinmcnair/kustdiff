@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -16,12 +17,23 @@ import (
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 )
 
+// kustomizationFileNames lists all filenames recognized as kustomization entry points.
+var kustomizationFileNames = []string{
+	"kustomization.yaml",
+	"kustomization.yml",
+	"Kustomization",
+}
+
 type config struct {
-	baseRef  string
-	headRef  string
-	rootDir  string
-	maxDepth int
-	debug    bool
+	baseRef    string
+	headRef    string
+	rootDir    string
+	maxDepth   int
+	debug      bool
+	maxWorkers int
+	fullBuild  bool
+	noCache    bool
+	cacheDir   string
 }
 
 func main() {
@@ -32,19 +44,38 @@ func main() {
 	}
 }
 
+func defaultCacheDir() string {
+	if d := os.Getenv("XDG_CACHE_HOME"); d != "" {
+		return filepath.Join(d, "kustdiff")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".cache", "kustdiff")
+}
+
 func parseConfig() config {
 	cfg := config{
-		baseRef:  os.Getenv("INPUT_BASE_REF"),
-		headRef:  os.Getenv("INPUT_HEAD_REF"),
-		rootDir:  envOrDefault("INPUT_ROOT_DIR", "kustomize"),
-		maxDepth: envIntOrDefault("INPUT_MAX_DEPTH", 2),
-		debug:    os.Getenv("DEBUG") == "true",
+		baseRef:    os.Getenv("INPUT_BASE_REF"),
+		headRef:    os.Getenv("INPUT_HEAD_REF"),
+		rootDir:    envOrDefault("INPUT_ROOT_DIR", "kustomize"),
+		maxDepth:   envIntOrDefault("INPUT_MAX_DEPTH", 2),
+		debug:      os.Getenv("DEBUG") == "true",
+		maxWorkers: envIntOrDefault("INPUT_WORKERS", runtime.NumCPU()),
+		fullBuild:  os.Getenv("INPUT_FULL_BUILD") == "true",
+		noCache:    os.Getenv("INPUT_NO_CACHE") == "true",
+		cacheDir:   envOrDefault("INPUT_CACHE_DIR", defaultCacheDir()),
 	}
 	flag.StringVar(&cfg.baseRef, "base", cfg.baseRef, "base git ref (branch, tag, or SHA)")
 	flag.StringVar(&cfg.headRef, "head", cfg.headRef, "head git ref (branch, tag, or SHA)")
 	flag.StringVar(&cfg.rootDir, "root", cfg.rootDir, "root directory containing kustomization files")
 	flag.IntVar(&cfg.maxDepth, "depth", cfg.maxDepth, "max depth to search for kustomization.yaml")
 	flag.BoolVar(&cfg.debug, "debug", cfg.debug, "enable debug logging")
+	flag.IntVar(&cfg.maxWorkers, "workers", cfg.maxWorkers, "max concurrent kustomize builds")
+	flag.BoolVar(&cfg.fullBuild, "full-build", cfg.fullBuild, "skip narrowing, build all targets")
+	flag.BoolVar(&cfg.noCache, "no-cache", cfg.noCache, "disable cache reads and writes")
+	flag.StringVar(&cfg.cacheDir, "cache-dir", cfg.cacheDir, "cache directory location")
 	flag.Parse()
 	return cfg
 }
@@ -81,6 +112,18 @@ func run(cfg config) error {
 	}
 	debugf("head %q -> %q", cfg.headRef, headRef)
 
+	// Determine changed files for narrowing (unless --full-build).
+	var changed []string
+	if !cfg.fullBuild {
+		changed, err = changedFiles(baseRef, headRef)
+		if err != nil {
+			debugf("changedFiles failed, falling back to full build: %v", err)
+			changed = nil // fall back to full build
+		} else {
+			debugf("changed files: %v", changed)
+		}
+	}
+
 	baseTree := filepath.Join(tmpDir, "base")
 	headTree := filepath.Join(tmpDir, "head")
 
@@ -105,22 +148,114 @@ func run(cfg config) error {
 		return err
 	}
 
-	// Build both trees concurrently. Within each tree, all kustomize
-	// targets are also built concurrently via a nested errgroup.
+	// Open cache (unless --no-cache).
+	var c *cache
+	if !cfg.noCache {
+		c, err = openCache(cfg.cacheDir)
+		if err != nil {
+			debugf("cache open failed, continuing without cache: %v", err)
+		}
+	}
+
+	// Discover targets in both trees.
+	baseAbsRoot := filepath.Join(baseTree, cfg.rootDir)
+	headAbsRoot := filepath.Join(headTree, cfg.rootDir)
+
+	baseTargets, _ := findTargetsIfExists(baseAbsRoot, cfg.maxDepth)
+	headTargets, _ := findTargetsIfExists(headAbsRoot, cfg.maxDepth)
+
+	// Apply narrowing if we have changed files.
+	if changed != nil && !cfg.fullBuild {
+		filteredBase := filterTargets(baseTargets, baseTree, cfg.rootDir, changed)
+		filteredHead := filterTargets(headTargets, headTree, cfg.rootDir, changed)
+
+		// Add orphan targets (new/removed targets that must always be built).
+		baseOrphans := orphanTargets(baseTargets, baseAbsRoot, headTargets, headAbsRoot)
+		headOrphans := orphanTargets(headTargets, headAbsRoot, baseTargets, baseAbsRoot)
+
+		baseTargets = dedup(append(filteredBase, baseOrphans...))
+		headTargets = dedup(append(filteredHead, headOrphans...))
+
+		debugf("narrowed base targets: %d, head targets: %d", len(baseTargets), len(headTargets))
+	}
+
+	// Build both trees concurrently.
 	var g errgroup.Group
 	g.Go(func() error {
-		debugf("building base (%s)", cfg.rootDir)
-		return buildAll(baseTree, cfg.rootDir, cfg.maxDepth, baseOut)
+		debugf("building base (%d targets)", len(baseTargets))
+		return buildFiltered(baseTargets, baseAbsRoot, baseOut, cfg.maxWorkers, c, baseRef, baseTree, debugf)
 	})
 	g.Go(func() error {
-		debugf("building head (%s)", cfg.rootDir)
-		return buildAll(headTree, cfg.rootDir, cfg.maxDepth, headOut)
+		debugf("building head (%d targets)", len(headTargets))
+		return buildFiltered(headTargets, headAbsRoot, headOut, cfg.maxWorkers, c, headRef, headTree, debugf)
 	})
 	if err := g.Wait(); err != nil {
 		return err
 	}
 
 	return runDiff(baseOut, headOut)
+}
+
+// findTargetsIfExists calls findTargets if the root exists, otherwise returns nil.
+func findTargetsIfExists(absRoot string, maxDepth int) ([]string, error) {
+	if _, err := os.Stat(absRoot); os.IsNotExist(err) {
+		return nil, nil
+	}
+	return findTargets(absRoot, maxDepth)
+}
+
+// dedup removes duplicate strings from a slice, preserving order.
+func dedup(ss []string) []string {
+	seen := make(map[string]bool, len(ss))
+	var result []string
+	for _, s := range ss {
+		if !seen[s] {
+			seen[s] = true
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// buildFiltered builds the given targets with optional caching.
+func buildFiltered(targets []string, absRoot, outDir string, workers int, c *cache, ref, worktreeRoot string, debugf func(string, ...any)) error {
+	var g errgroup.Group
+	if workers > 0 {
+		g.SetLimit(workers)
+	}
+	for _, target := range targets {
+		target := target
+		rel, _ := filepath.Rel(absRoot, target)
+		outFile := filepath.Join(outDir, safeFilename(rel)+".yaml")
+		g.Go(func() error {
+			// Try cache lookup.
+			if c != nil {
+				deps, err := collectDeps(target, make(map[string]bool))
+				if err == nil {
+					key, err := cacheKey(ref, rel, deps, worktreeRoot)
+					if err == nil && key != "" {
+						if data, ok := c.Get(key); ok {
+							debugf("cache hit for %s", rel)
+							return os.WriteFile(outFile, data, 0o644)
+						}
+						// Cache miss — build and store.
+						if err := buildTarget(target, outFile); err != nil {
+							return err
+						}
+						data, err := os.ReadFile(outFile)
+						if err == nil {
+							_ = c.Put(key, data)
+						}
+						return nil
+					}
+				}
+				// Dep parse or cache key failed — fall through to plain build.
+				debugf("cache key computation failed for %s, building fresh", rel)
+			}
+			return buildTarget(target, outFile)
+		})
+	}
+	return g.Wait()
 }
 
 // resolveRef resolves a human-friendly ref to something git can checkout.
@@ -153,11 +288,11 @@ func removeWorktree(path string) {
 }
 
 // findTargets walks rootDir up to maxDepth levels and returns every directory
-// that contains a kustomization.yaml, matching the behaviour of:
-//
-//	find <rootDir> -maxdepth <maxDepth> -name kustomization.yaml -exec dirname {} \;
+// that contains a kustomization file (kustomization.yaml, kustomization.yml,
+// or Kustomization).
 func findTargets(rootDir string, maxDepth int) ([]string, error) {
 	var targets []string
+	seen := make(map[string]bool)
 	err := filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -170,8 +305,17 @@ func findTargets(rootDir string, maxDepth int) ([]string, error) {
 		if d.IsDir() && depth >= maxDepth {
 			return filepath.SkipDir
 		}
-		if !d.IsDir() && d.Name() == "kustomization.yaml" {
-			targets = append(targets, filepath.Dir(path))
+		if !d.IsDir() {
+			for _, name := range kustomizationFileNames {
+				if d.Name() == name {
+					dir := filepath.Dir(path)
+					if !seen[dir] {
+						seen[dir] = true
+						targets = append(targets, dir)
+					}
+					break
+				}
+			}
 		}
 		return nil
 	})
@@ -180,7 +324,7 @@ func findTargets(rootDir string, maxDepth int) ([]string, error) {
 
 // buildAll discovers kustomize targets inside worktreeDir/rootDir and builds
 // them all concurrently, writing one YAML file per target into outDir.
-func buildAll(worktreeDir, rootDir string, maxDepth int, outDir string) error {
+func buildAll(worktreeDir, rootDir string, maxDepth, workers int, outDir string) error {
 	absRoot := filepath.Join(worktreeDir, rootDir)
 	if _, err := os.Stat(absRoot); os.IsNotExist(err) {
 		// rootDir doesn't exist in this tree (e.g. PR introduces it for the first time).
@@ -193,6 +337,9 @@ func buildAll(worktreeDir, rootDir string, maxDepth int, outDir string) error {
 	}
 
 	var g errgroup.Group
+	if workers > 0 {
+		g.SetLimit(workers)
+	}
 	for _, target := range targets {
 		target := target
 		rel, _ := filepath.Rel(absRoot, target)
@@ -204,11 +351,23 @@ func buildAll(worktreeDir, rootDir string, maxDepth int, outDir string) error {
 	return g.Wait()
 }
 
+// findKustomizationFile returns the path to the kustomization file in dir,
+// or an empty string if none is found.
+func findKustomizationFile(dir string) string {
+	for _, name := range kustomizationFileNames {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 // buildTarget runs kustomize on a single directory and writes the rendered
 // YAML to outFile. Uses the krusty library directly — no subprocess.
 func buildTarget(envPath, outFile string) error {
 	opts := krusty.MakeDefaultOptions()
-	if hasHelmCharts(filepath.Join(envPath, "kustomization.yaml")) {
+	if kf := findKustomizationFile(envPath); kf != "" && hasHelmCharts(kf) {
 		opts.PluginConfig.HelmConfig.Enabled = true
 		opts.PluginConfig.HelmConfig.Command = "helm"
 	}
